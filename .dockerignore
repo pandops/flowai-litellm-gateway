@@ -1,0 +1,10 @@
+**
+!Containerfile
+!entrypoint.sh
+!config/
+!config/litellm.yaml
+!LICENSE
+!licenses/
+!licenses/LiteLLM-LICENSE
+!licenses/PgBouncer-COPYRIGHT
+!licenses/PgBouncer-lib-COPYRIGHT
