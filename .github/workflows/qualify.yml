@@ -36,9 +36,41 @@ jobs:
         shell: bash
         run: |
           [[ "$(git rev-parse HEAD)" == "${EXPECTED_SOURCE_SHA,,}" ]]
-          [[ -f Containerfile && -x qualification/verify-upstream.sh ]]
+          [[ -f Containerfile ]]
           qualification_dir=$(mktemp -d "$RUNNER_TEMP/litellm-qualification.XXXXXXXX")
-          qualification/verify-upstream.sh "$qualification_dir"
+          set -euo pipefail
+          output=$qualification_dir
+          index=bc803c88c244d6193b0f40bffad1124c624109513e56332b03c20d121a9546fb
+          amd64=ec96da9f0c6286523a1f7646ecc8991c2455fb9b32cd24d19f9d237ff17ce6cf
+          arm64=66d944d56370313bcf3bed9bfdee91d7f199122e76b194be460fc8661ba85711
+          source=e926084212ab2eb234c58840d741b3c62c35911b
+          token=$(curl -q -fsS 'https://ghcr.io/token?scope=repository:berriai/litellm:pull' |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          for ref in "sha256:$index" "sha256:$amd64" "sha256:$arm64" v1.104.0-rc.2; do
+            curl -q -fsS --retry 2 --max-time 45 --proto '=https' -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/berriai/litellm/manifests/$ref" -o "$output/${ref#sha256:}.json"
+          done
+          (
+            cd "$output"
+            printf '%s  %s\n' "$index" "$index.json" "$index" v1.104.0-rc.2.json \
+              "$amd64" "$amd64.json" "$arm64" "$arm64.json" | sha256sum --check
+          )
+          python3 - "$output/$index.json" "$amd64" "$arm64" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as file:
+              index = json.load(file)
+          assert index["mediaType"] == "application/vnd.oci.image.index.v1+json"
+          platforms = {d["platform"]["architecture"]: d["digest"]
+                       for d in index["manifests"] if d["platform"]["os"] == "linux"}
+          assert platforms == {"amd64": "sha256:" + sys.argv[2], "arm64": "sha256:" + sys.argv[3]}
+          PYTHON
+          curl -q -fsS --retry 2 --max-time 45 --proto '=https' \
+            "https://raw.githubusercontent.com/BerriAI/litellm/$source/LICENSE" -o "$output/LiteLLM-LICENSE"
+          cmp licenses/LiteLLM-LICENSE "$output/LiteLLM-LICENSE"
+          printf 'upstream_version=v1.104.0-rc.2 upstream_source=%s upstream_index=sha256:%s upstream_amd64=sha256:%s upstream_arm64=sha256:%s\n' "$source" "$index" "$amd64" "$arm64"
           printf 'QUALIFICATION_DIR=%s\n' "$qualification_dir" >> "$GITHUB_ENV"
 
       - name: Build and inspect the OCI image
@@ -50,11 +82,327 @@ jobs:
           podman push --format oci --compression-format gzip \
             --digestfile "$QUALIFICATION_DIR/manifest.digest" "$(cat "$QUALIFICATION_DIR/image.id")" \
             "oci:$QUALIFICATION_DIR/image"
-          python3 qualification/inspect-oci.py "$QUALIFICATION_DIR/image" \
+          python3 - "$QUALIFICATION_DIR/image" \
             "$QUALIFICATION_DIR/ec96da9f0c6286523a1f7646ecc8991c2455fb9b32cd24d19f9d237ff17ce6cf.json" \
-            "$(cat "$QUALIFICATION_DIR/manifest.digest")"
+            "$(cat "$QUALIFICATION_DIR/manifest.digest")" <<'PYTHON'
+          """Inspect the immutable, unextracted tar streams in the qualification OCI layout."""
+
+          import gzip
+          import hashlib
+          import io
+          import json
+          import pathlib
+          import posixpath
+          import sys
+          import tarfile
+          import zipfile
+
+          OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+          SITE = "app/.venv/lib/python3.13/site-packages/"
+          MIT_CORE = SITE + "litellm/proxy/"
+          PINNED_ARCHIVES = {
+              SITE + "dateutil/zoneinfo/dateutil-zoneinfo.tar.gz",
+              SITE + "ddtrace/internal/third-party.tar.gz",
+              "usr/lib/apk/db/scripts.tar",
+              "usr/share/python-wheels/pip-26.2.1-py3-none-any.whl",
+          }
+          LICENSE_BASE = "usr/share/licenses/flowai-litellm-gateway/"
+          NOTICE_FILES = {
+              LICENSE_BASE + "LICENSE": "LICENSE",
+              LICENSE_BASE + "LiteLLM-LICENSE": "licenses/LiteLLM-LICENSE",
+              LICENSE_BASE + "PgBouncer-COPYRIGHT": "licenses/PgBouncer-COPYRIGHT",
+              LICENSE_BASE + "PgBouncer-lib-COPYRIGHT": "licenses/PgBouncer-lib-COPYRIGHT",
+          }
+
+
+          def check_path(path):
+              if path.startswith("/"):
+                  raise ValueError("unexpected absolute archive entry")
+              path = posixpath.normpath(path)
+              if path == ".." or path.startswith("../"):
+                  raise ValueError("archive traversal")
+              parts = path.lower().split("/")
+              if path == "app/litellm-proxy-extras/dist" or path.startswith("app/litellm-proxy-extras/dist/"):
+                  raise ValueError("retained proxy-extras distribution archive")
+              if any("enterprise" in part for part in parts):
+                  allowed = {
+                      MIT_CORE + "enterprise_billing",
+                      MIT_CORE + "enterprise_billing/__init__.py",
+                      MIT_CORE + "enterprise_billing/billing_metrics.py",
+                      MIT_CORE + "example_config_yaml/enterprise_config.yaml",
+                  }
+                  if path not in allowed:
+                      raise ValueError("unexpected enterprise path or link target")
+              return path
+
+
+          def check_nested(path, stream):
+              data = stream.read()
+              if path.endswith(".whl"):
+                  with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                      for member in archive.infolist():
+                          check_path(member.filename)
+                      return len(archive.infolist())
+              with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+                  for member in archive:
+                      check_path(member.name)
+                      if member.issym() or member.islnk():
+                          check_path(posixpath.normpath(member.linkname.lstrip("/")))
+                  return len(archive.getmembers())
+
+
+          def sha(stream):
+              return "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+          def checked_blob(root, descriptor):
+              digest = descriptor["digest"]
+              algorithm, identifier = digest.split(":")
+              assert algorithm == "sha256" and len(identifier) == 64
+              blob = root / "blobs" / algorithm / identifier
+              assert blob.stat().st_size == descriptor["size"]
+              with blob.open("rb") as stream:
+                  assert sha(stream) == digest
+              return blob
+
+
+          def main(root, upstream_path, expected_digest):
+              index = json.loads((root / "index.json").read_text())
+              descriptor, = index["manifests"]
+              assert descriptor["digest"] == expected_digest
+              assert descriptor["mediaType"] == OCI_MANIFEST
+              manifest = json.loads(checked_blob(root, descriptor).read_text())
+              config = json.loads(checked_blob(root, manifest["config"]).read_text())
+              upstream = json.loads(upstream_path.read_text())
+              upstream_layers = {layer["digest"] for layer in upstream["layers"]}
+              assert manifest["mediaType"] == OCI_MANIFEST
+              assert (config["os"], config["architecture"]) == ("linux", "amd64")
+              runtime = config["config"]
+              assert runtime["User"] == "65532:65532" and runtime["WorkingDir"] == "/app"
+              assert runtime["Entrypoint"] == ["/usr/local/bin/flowai-litellm-gateway"]
+              assert not runtime.get("Cmd")
+              assert runtime["ExposedPorts"] == {"4000/tcp": {}}
+              assert set(runtime["Env"]) == {
+                  "PATH=/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin",
+                  "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+                  "PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries",
+                  "PRISMA_CLI_PATH=/opt/prisma/binaries/node_modules/.bin/prisma",
+                  "PRISMA_CLI_QUERY_ENGINE_TYPE=binary",
+                  "PRISMA_OFFLINE_MODE=true",
+                  "HOME=/tmp",
+              }
+              originals = {
+                  "etc/flowai-litellm/litellm.yaml": "config/litellm.yaml",
+                  "usr/local/bin/flowai-litellm-gateway": "entrypoint.sh",
+                  **NOTICE_FILES,
+              }
+              verified = set()
+              nested = {}
+              for layer, diff_id in zip(manifest["layers"], config["rootfs"]["diff_ids"], strict=True):
+                  assert layer["digest"] not in upstream_layers
+                  assert layer["mediaType"] == "application/vnd.oci.image.layer.v1.tar+gzip"
+                  blob = checked_blob(root, layer)
+                  with gzip.open(blob, "rb") as stream:
+                      assert sha(stream) == diff_id
+                  count = links = notices = 0
+                  with tarfile.open(blob, "r|gz") as archive:
+                      for member in archive:
+                          name = check_path(member.name)
+                          assert ".wh." not in posixpath.basename(name)
+                          count += 1
+                          if member.issym():
+                              check_path(posixpath.join(posixpath.dirname(name), member.linkname)
+                                         if not member.linkname.startswith("/") else member.linkname.lstrip("/"))
+                              links += 1
+                          if member.islnk():
+                              check_path(member.linkname.lstrip("/"))
+                              links += 1
+                          if not member.isfile():
+                              continue
+                          if any(word in posixpath.basename(name).lower()
+                                 for word in ("license", "licence", "copying", "copyright", "notice")):
+                              notices += 1
+                          if name in originals:
+                              with archive.extractfile(member) as stream, open(originals[name], "rb") as source:
+                                  assert sha(stream) == sha(source)
+                              verified.add(name)
+                          if name.endswith((".tar", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst",
+                                            ".tgz", ".whl", ".zip", ".jar", ".7z", ".deb", ".rpm", ".apk")):
+                              assert name in PINNED_ARCHIVES
+                              with archive.extractfile(member) as stream:
+                                  nested[name] = check_nested(name, stream)
+                  print(f"layer={layer['digest']} diff_id={diff_id} entries={count} links={links} notices={notices}")
+              assert verified == originals.keys()
+              assert nested.keys() == PINNED_ARCHIVES
+              expected = {descriptor["digest"], manifest["config"]["digest"],
+                          *(layer["digest"] for layer in manifest["layers"])}
+              actual = {"sha256:" + path.name for path in (root / "blobs" / "sha256").iterdir()}
+              assert actual == expected
+              print(f"nested_archives={len(nested)} members={sum(nested.values())}")
+              print(f"output_platform=linux/amd64 output_media_type={OCI_MANIFEST}")
+              print(f"output_config={manifest['config']['digest']} output_manifest={expected_digest}")
+
+
+          if __name__ == "__main__":
+              main(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3])
+          PYTHON
 
       - name: Verify the packaged gateway
         shell: bash
         run: |
-          qualification/check-runtime.sh "$(cat "$QUALIFICATION_DIR/image.id")"
+          # Exercise the packaged FlowAI wrapper against a disposable PostgreSQL dependency.
+          set -euo pipefail
+          image="$(cat "$QUALIFICATION_DIR/image.id")"
+          tmp=$(mktemp -d)
+          prefix=flowai-litellm-$(basename "$tmp" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+          network=$prefix-net
+          db=$prefix-db
+          gateway=$prefix-gateway
+          missing=$prefix-missing
+          cleanup() {
+            local result=$?
+            trap - EXIT
+            podman rm -f -v --ignore "$gateway" "$db" "$missing" >/dev/null || result=1
+            if podman network exists "$network"; then
+              podman network rm "$network" >/dev/null || result=1
+            fi
+            for resource in "$gateway" "$db" "$missing"; do
+              if podman container exists "$resource"; then result=1; fi
+            done
+            if podman network exists "$network"; then result=1; fi
+            rm -rf -- "$tmp"
+            if [[ "$result" == 0 ]]; then printf 'owned gateway, fixture and network absent\n'; fi
+            exit "$result"
+          }
+          trap cleanup EXIT
+
+          status=0
+          podman run --name "$missing" --network none "$image" > "$tmp/missing.log" 2>&1 || status=$?
+          [[ "$status" == 64 ]]
+          grep -Fxq 'flowai-litellm-gateway: required input LITELLM_MASTER_KEY is missing' "$tmp/missing.log"
+          printf 'missing input rejected with exit 64\n'
+          umask 077
+          python3 - "$tmp" "$db" <<'PYTHON'
+          import pathlib
+          import secrets
+          import sys
+
+          directory = pathlib.Path(sys.argv[1])
+          password, master, salt = (secrets.token_hex(24) for _ in range(3))
+          (directory / "postgres.env").write_text(
+              f"POSTGRES_USER=flowai\nPOSTGRES_PASSWORD={password}\nPOSTGRES_DB=flowai\n"
+          )
+          (directory / "gateway.env").write_text(
+              f"DATABASE_URL=postgresql://flowai:{password}@{sys.argv[2]}:5432/flowai\n"
+              f"LITELLM_MASTER_KEY=sk-{master}\nLITELLM_SALT_KEY={salt}\n"
+              "LITELLM_LOCAL_MODEL_COST_MAP=true\n"
+          )
+          PYTHON
+          podman network create --internal "$network" >/dev/null
+          podman run -d --name "$db" --network "$network" --env-file "$tmp/postgres.env" \
+            docker.io/library/postgres@sha256:a85daf0dbd5e79586e850e3fe4b21b796799828ad015ce2166aeb98cc24da61c \
+            >/dev/null
+          # Expand positional parameters in the timeout subprocess.
+          # shellcheck disable=SC2016
+          timeout 60 bash -c 'until podman exec "$1" pg_isready -h 127.0.0.1 -U flowai -d flowai >/dev/null 2>&1; do sleep 1; done' _ "$db"
+
+          start() {
+            podman run -d --name "$gateway" --network "$network" --env-file "$tmp/gateway.env" "$image" >/dev/null
+          }
+          probe() {
+            for ((attempt = 0; attempt < 100; attempt++)); do
+              if podman exec -i "$gateway" python -B - "$1" > "$tmp/probe.log" 2>&1 <<'PYTHON'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          assert (os.getuid(), os.getgid()) == (65532, 65532)
+          headers = {"Authorization": "Bearer " + os.environ["LITELLM_MASTER_KEY"],
+                     "Content-Type": "application/json"}
+
+
+          def request(path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request("http://127.0.0.1:4000" + path, data=data, headers=headers)
+              with urllib.request.urlopen(req, timeout=3) as response:
+                  return json.load(response)
+
+
+          assert request("/health/readiness")["db"] == "connected"
+          alias = "flowai-package-qualification"
+          if sys.argv[1] == "create":
+              request("/model/new", {
+                  "model_name": alias,
+                  "litellm_params": {"model": "openai/flowai-package-qualification"},
+                  "model_info": {"flowai_model_id": 42},
+              })
+          else:
+              models = request("/model/info")["data"]
+              assert any(model["model_name"] == alias and model["model_info"]["flowai_model_id"] == 42
+                         for model in models)
+          PYTHON
+              then return 0; fi
+              if [[ "$(podman inspect --format '{{.State.Running}}' "$gateway")" != true ]]; then break; fi
+              sleep 2
+            done
+            printf 'Packaged gateway did not pass the %s probe.\n' "$1" >&2
+            return 1
+          }
+          start
+          probe create
+          printf 'nonroot startup, database-backed readiness and FlowAI model write passed\n'
+          podman rm -f -v "$gateway" >/dev/null
+          start
+          probe read
+          printf 'FlowAI model metadata survived gateway recreation\n'
+
+      - name: Verify and package the qualified OCI image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_id="$(cat "$QUALIFICATION_DIR/image.id")"
+          [[ "$image_id" =~ ^(sha256:)?[a-f0-9]{64}$ ]]
+          image_id="sha256:${image_id#sha256:}"
+          layout="$QUALIFICATION_DIR/image"
+          manifest="$(jq -er '
+            select(.schemaVersion == 2 and (.manifests | length) == 1)
+            | .manifests[0]
+            | select(.mediaType == "application/vnd.oci.image.manifest.v1+json")
+            | .digest | select(test("^sha256:[a-f0-9]{64}$"))
+          ' "$layout/index.json")"
+          cd "$layout"
+          manifest_path="blobs/sha256/${manifest#sha256:}"
+          printf '%s  %s\n' "${manifest#sha256:}" "$manifest_path" | sha256sum --check
+          config="$(jq -er '.config.digest | select(test("^sha256:[a-f0-9]{64}$"))' "$manifest_path")"
+          [[ "$manifest" == "$(cat "$QUALIFICATION_DIR/manifest.digest")" ]]
+          jq -er '
+            [.config, .layers[]][].digest
+            | if test("^sha256:[a-f0-9]{64}$") then sub("^sha256:"; "") else error("invalid OCI digest") end
+            | "\(.)  blobs/sha256/\(.)"
+          ' "$manifest_path" | sha256sum --check
+          jq -e '.os == "linux" and .architecture == "amd64"' "blobs/sha256/${config#sha256:}" >/dev/null
+
+          artifact="$RUNNER_TEMP/qualified-oci"
+          mkdir "$artifact"
+          tar -cf "$artifact/image.oci.tar" oci-layout index.json blobs
+          cd "$artifact"
+          jq -n --arg repository "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF" \
+            --arg source "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg imageId "$image_id" --arg manifest "$manifest" --arg config "$config" \
+            '{repository:$repository,ref:$ref,source:$source,run:$run,attempt:$attempt,imageId:$imageId,manifest:$manifest,config:$config}' > receipt.json
+          sha256sum image.oci.tar receipt.json > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload qualified OCI archive
+        if: ${{ success() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualified-oci-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/qualified-oci/image.oci.tar
+            ${{ runner.temp }}/qualified-oci/receipt.json
+            ${{ runner.temp }}/qualified-oci/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
