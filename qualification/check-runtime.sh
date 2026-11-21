@@ -12,7 +12,9 @@ cleanup() {
   local result=$?
   trap - EXIT
   podman rm -f -v --ignore "$gateway" "$db" "$missing" >/dev/null || result=1
-  podman network rm --ignore "$network" >/dev/null || result=1
+  if podman network exists "$network"; then
+    podman network rm "$network" >/dev/null || result=1
+  fi
   for resource in "$gateway" "$db" "$missing"; do
     if podman container exists "$resource"; then result=1; fi
   done
