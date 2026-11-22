@@ -647,7 +647,6 @@ jobs:
           workflow="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"
           workflow="${workflow%@*}"
           build=success
-          if [[ -n "$REUSE_DIGEST" ]]; then build=not-applicable; fi
           jq -n --arg repository "$GITHUB_REPOSITORY" --arg source "$GITHUB_SHA" \
             --arg built "$BUILD_SOURCE" --arg version "$VERSION" --arg digest "${IMAGE_REF#*@}" \
             --arg workflow "$workflow" --argjson run "$GITHUB_RUN_ID" --arg build "$build" '
