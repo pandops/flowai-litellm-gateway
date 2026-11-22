@@ -99,13 +99,17 @@ jobs:
           REUSE_PIN: ${{ inputs.reuse_image }}
           PRODUCTION_PATHS: "[\"Containerfile\",\"config\",\"entrypoint.sh\",\"LICENSE\",\"licenses\"]"
           INITIAL_IMPORT: ""
-          BUILD_RECIPE: "podman linux/amd64 OCI timestamp=0 omit-history gzip"
         run: |
           mapfile -t paths < <(jq -er '.[]' <<< "$PRODUCTION_PATHS")
+          workflow_json() {
+            git show "$1:$2" | yq -p yaml -o json '.'
+          }
           production_tree() {
+            local source="$1"
             {
-              git ls-tree -r "$1" -- "${paths[@]}" | sed '/_test\.go$/d'
-              printf '%s\n' "$BUILD_RECIPE"
+              git ls-tree -r "$source" -- "${paths[@]}" | sed '/_test\.go$/d' || return
+              workflow_json "$source" .github/workflows/qualify.yml |
+                jq -ce '.jobs.container as $job | [$job."runs-on", ($job.steps[] | select(.id == "assemble") | {shell,run,env})] | select(length == 2)' || return
             } | sha256sum | cut -d ' ' -f1
           }
           identity="$(production_tree "$GITHUB_SHA")"
@@ -204,6 +208,8 @@ jobs:
       EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       VERSION: ${{ needs.application.outputs.version }}
       REUSE_DIGEST: ${{ needs.application.outputs.reuse_digest }}
+      BUILD_SOURCE: ${{ needs.application.outputs.build_source_revision }}
+      PRODUCTION_IDENTITY: ${{ needs.application.outputs.production_identity }}
     defaults:
       run:
         shell: bash
@@ -214,7 +220,6 @@ jobs:
           persist-credentials: false
 
       - name: Verify checkout and upstream
-        if: ${{ needs.application.outputs.reuse_digest == '' }}
         shell: bash
         run: |
           [[ "$(git rev-parse HEAD)" == "${EXPECTED_SOURCE_SHA,,}" ]]
@@ -255,10 +260,13 @@ jobs:
           printf 'upstream_version=v1.104.0-rc.2 upstream_source=%s upstream_index=sha256:%s upstream_amd64=sha256:%s upstream_arm64=sha256:%s\n' "$source" "$index" "$amd64" "$arm64"
           printf 'QUALIFICATION_DIR=%s\n' "$qualification_dir" >> "$GITHUB_ENV"
 
-      - name: Build and inspect the OCI image
+      - name: Assemble the LiteLLM runtime
+        id: assemble
         if: ${{ needs.application.outputs.reuse_digest == '' }}
-        shell: bash
         run: |
+          [[ "$BUILD_SOURCE" =~ ^[a-f0-9]{40}$ && "$BUILD_SOURCE" == "$GITHUB_SHA" ]]
+          [[ "$PRODUCTION_IDENTITY" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ -n "$VERSION" ]]
           context="$RUNNER_TEMP/runtime"
           mkdir -p "$context/config" "$context/licenses"
           cp Containerfile entrypoint.sh LICENSE "$context/"
@@ -266,10 +274,38 @@ jobs:
           cp licenses/LiteLLM-LICENSE licenses/PgBouncer*-COPYRIGHT "$context/licenses/"
           podman --version
           podman build --platform linux/amd64 --format oci --timestamp 0 --omit-history \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$BUILD_SOURCE" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "io.flowai.production-inputs=$PRODUCTION_IDENTITY" \
             --iidfile "$QUALIFICATION_DIR/image.id" --file "$context/Containerfile" "$context"
-          podman push --format oci --compression-format gzip \
-            --digestfile "$QUALIFICATION_DIR/manifest.digest" "$(cat "$QUALIFICATION_DIR/image.id")" \
-            "oci:$QUALIFICATION_DIR/image"
+
+      - name: Pull the exact retained runtime
+        if: ${{ needs.application.outputs.reuse_digest != '' }}
+        run: |
+          [[ "$REUSE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$BUILD_SOURCE" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$PRODUCTION_IDENTITY" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ -n "$VERSION" ]]
+          image="ghcr.io/$GITHUB_REPOSITORY@$REUSE_DIGEST"
+          auth="$QUALIFICATION_DIR/anonymous.json"
+          printf '{}\n' > "$auth"
+          podman pull --authfile "$auth" --platform linux/amd64 "$image"
+          podman image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" |
+            grep -Fx -- "$image" >/dev/null
+          podman image inspect --format '{{.Id}}' "$image" > "$QUALIFICATION_DIR/image.id"
+          skopeo copy --preserve-digests --src-authfile "$auth" \
+            "docker://$image" "oci:$QUALIFICATION_DIR/image"
+          printf '%s\n' "$REUSE_DIGEST" > "$QUALIFICATION_DIR/manifest.digest"
+
+      - name: Inspect the selected runtime and its layers
+        shell: bash
+        run: |
+          if [[ -z "$REUSE_DIGEST" ]]; then
+            podman push --format oci --compression-format gzip \
+              --digestfile "$QUALIFICATION_DIR/manifest.digest" "$(cat "$QUALIFICATION_DIR/image.id")" \
+              "oci:$QUALIFICATION_DIR/image"
+          fi
           python3 - "$QUALIFICATION_DIR/image" \
             "$QUALIFICATION_DIR/ec96da9f0c6286523a1f7646ecc8991c2455fb9b32cd24d19f9d237ff17ce6cf.json" \
             "$(cat "$QUALIFICATION_DIR/manifest.digest")" <<'PYTHON'
@@ -279,6 +315,7 @@ jobs:
           import hashlib
           import io
           import json
+          import os
           import pathlib
           import posixpath
           import sys
@@ -350,17 +387,30 @@ jobs:
               blob = root / "blobs" / algorithm / identifier
               assert blob.stat().st_size == descriptor["size"]
               with blob.open("rb") as stream:
-                  assert sha(stream) == digest
+                  assert sha(stream) == digest, "OCI blob digest mismatch"
               return blob
 
 
           def main(root, upstream_path, expected_digest):
               index = json.loads((root / "index.json").read_text())
               descriptor, = index["manifests"]
-              assert descriptor["digest"] == expected_digest
+              assert descriptor["digest"] == expected_digest, "OCI manifest descriptor mismatch"
               assert descriptor["mediaType"] == OCI_MANIFEST
               manifest = json.loads(checked_blob(root, descriptor).read_text())
               config = json.loads(checked_blob(root, manifest["config"]).read_text())
+              if os.environ["REUSE_DIGEST"]:
+                  assert expected_digest == os.environ["REUSE_DIGEST"], "retained manifest digest mismatch"
+              image_id = (root.parent / "image.id").read_text().strip().removeprefix("sha256:")
+              assert "sha256:" + image_id == manifest["config"]["digest"], "Podman image ID mismatch"
+              labels = config["config"].get("Labels") or {}
+              expected_labels = {
+                  "org.opencontainers.image.source": "https://github.com/" + os.environ["GITHUB_REPOSITORY"],
+                  "org.opencontainers.image.revision": os.environ["BUILD_SOURCE"],
+                  "org.opencontainers.image.version": os.environ["VERSION"],
+                  "io.flowai.production-inputs": os.environ["PRODUCTION_IDENTITY"],
+              }
+              for name, value in expected_labels.items():
+                  assert labels.get(name) == value, f"OCI label mismatch: {name}"
               upstream = json.loads(upstream_path.read_text())
               upstream_layers = {layer["digest"] for layer in upstream["layers"]}
               assert manifest["mediaType"] == OCI_MANIFEST
@@ -436,7 +486,6 @@ jobs:
           PYTHON
 
       - name: Verify the packaged gateway
-        if: ${{ needs.application.outputs.reuse_digest == '' }}
         shell: bash
         run: |
           # Exercise the packaged FlowAI wrapper against a disposable PostgreSQL dependency.
@@ -564,11 +613,11 @@ jobs:
           check_digest() {
             printf '%s  %s\n' "${digest#sha256:}" "$state/manifest" | sha256sum --check
           }
+          digest="$(cat "$QUALIFICATION_DIR/manifest.digest")"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           if [[ -n "$REUSE_DIGEST" ]]; then
-            digest="$REUSE_DIGEST"
+            [[ "$digest" == "$REUSE_DIGEST" ]]
           else
-            digest="$(cat "$QUALIFICATION_DIR/manifest.digest")"
-            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
             token="$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GHCR_TOKEN" |
               curl -q --config - -fsS --max-time 30 --get https://ghcr.io/token \
                 --data-urlencode service=ghcr.io --data-urlencode "$scope,push" | jq -er .token)"
@@ -593,7 +642,6 @@ jobs:
             esac
           fi
 
-          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           public="$(curl -q -fsS --max-time 30 --get https://ghcr.io/token \
             --data-urlencode service=ghcr.io --data-urlencode "$scope" | jq -er .token)"
           [[ "$public" =~ ^[A-Za-z0-9_.=+/-]+$ ]]
@@ -602,8 +650,10 @@ jobs:
             [[ "$(lookup "$public" "$locator")" == 200 ]]
             check_digest
           done
-          printf '{}\n' > "$state/anonymous.json"
-          podman pull --authfile "$state/anonymous.json" --platform linux/amd64 "$image@$digest"
+          if [[ -z "$REUSE_DIGEST" ]]; then
+            printf '{}\n' > "$state/anonymous.json"
+            podman pull --authfile "$state/anonymous.json" --platform linux/amd64 "$image@$digest"
+          fi
           printf 'image_ref=%s@%s\n' "$image" "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Record the stable semantic-release version
@@ -642,7 +692,6 @@ jobs:
       - name: Emit qualification receipt
         env:
           IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
-          BUILD_SOURCE: ${{ needs.application.outputs.build_source_revision }}
         run: |
           workflow="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"
           workflow="${workflow%@*}"
