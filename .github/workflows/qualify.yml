@@ -1,8 +1,12 @@
-name: Qualify LiteLLM Gateway source
+name: Qualify and publish LiteLLM Gateway
 
 on:
   workflow_dispatch:
     inputs:
+      reuse_image:
+        description: Existing qualified image pin as JSON when production inputs are unchanged
+        type: string
+        required: false
       expected_source_sha:
         description: Full commit SHA of the selected LiteLLM Gateway ref
         type: string
@@ -12,8 +16,15 @@ permissions:
   contents: read
 
 jobs:
-  qualify:
+  application:
+    name: Qualify the upstream and runtime inputs
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      stage: ${{ steps.version.outputs.stage }}
+      production_identity: ${{ steps.version.outputs.production_identity }}
+      reuse_digest: ${{ steps.version.outputs.reuse_digest }}
+      build_source_revision: ${{ steps.version.outputs.build_source_revision }}
     timeout-minutes: 25
     env:
       EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
@@ -30,6 +41,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify checkout and upstream
@@ -73,12 +85,188 @@ jobs:
           printf 'upstream_version=v1.104.0-rc.2 upstream_source=%s upstream_index=sha256:%s upstream_amd64=sha256:%s upstream_arm64=sha256:%s\n' "$source" "$index" "$amd64" "$arm64"
           printf 'QUALIFICATION_DIR=%s\n' "$qualification_dir" >> "$GITHUB_ENV"
 
-      - name: Build and inspect the OCI image
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: ${{ inputs.reuse_image == '' }}
+        with:
+          node-version: '24.20.0'
+          package-manager-cache: false
+
+      - name: Resolve the artifact version
+        id: version
+        shell: bash
+        env:
+          REUSE_PIN: ${{ inputs.reuse_image }}
+          PRODUCTION_PATHS: "[\"Containerfile\",\"config\",\"entrypoint.sh\",\"LICENSE\",\"licenses\"]"
+          INITIAL_IMPORT: ""
+          BUILD_RECIPE: "podman linux/amd64 OCI timestamp=0 omit-history gzip"
+        run: |
+          mapfile -t paths < <(jq -er '.[]' <<< "$PRODUCTION_PATHS")
+          production_tree() {
+            {
+              git ls-tree -r "$1" -- "${paths[@]}" | sed '/_test\.go$/d'
+              printf '%s\n' "$BUILD_RECIPE"
+            } | sha256sum | cut -d ' ' -f1
+          }
+          identity="$(production_tree "$GITHUB_SHA")"
+          printf 'production_identity=sha256:%s\n' "$identity" >> "$GITHUB_OUTPUT"
+          release_branch="$GITHUB_REF_NAME"
+          stable='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          version_pattern="^${stable}$"
+          stage=stable
+          if [[ "$release_branch" != master ]]; then
+            stage=snapshot
+            # Give each distinct input set its own prerelease channel. This
+            # also separates it from the earlier pilot snapshots in GHCR.
+            channel="snapshot-${identity:0:16}"
+            release_branch="$channel"
+            version_pattern="^${stable}-${channel}\.[1-9][0-9]*$"
+          fi
+          printf 'stage=%s\n' "$stage" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$REUSE_PIN" ]]; then
+            build_source="$(jq -er '.buildSourceRevision | select(test("^[a-f0-9]{40}$"))' <<< "$REUSE_PIN")"
+            digest="$(jq -er '.imageDigest | select(test("^sha256:[a-f0-9]{64}$"))' <<< "$REUSE_PIN")"
+            version="$(jq -er .version <<< "$REUSE_PIN")"
+            [[ "$(production_tree "$build_source")" == "$identity" ]]
+            if [[ "$stage" == stable ]]; then
+              [[ "$version" =~ ^${stable}$ ]]
+            else
+              [[ "$version" =~ ^${stable}-[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*$ ]]
+            fi
+            printf 'version=%s\nbuild_source_revision=%s\nreuse_digest=%s\n' \
+              "$version" "$build_source" "$digest" >> "$GITHUB_OUTPUT"
+            exit
+          fi
+          printf 'build_source_revision=%s\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+          mapfile -t existing < <(git tag --points-at "$GITHUB_SHA" | awk '/^v/ {print substr($0,2)}')
+          for version in "${existing[@]}"; do
+            if [[ "$version" =~ $version_pattern ]]; then
+              printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+              exit
+            fi
+          done
+
+          lock_root="$(mktemp -d "$RUNNER_TEMP/semantic-release.XXXXXXXX")"
+          trusted=https://raw.githubusercontent.com/pandops/flowai-team-registry/c18e7cdde5d5b976f549d1dc486f60776cbb8718/.github/semantic-release
+          for file in package.json package-lock.json; do
+            curl -q --fail --silent --show-error --proto '=https' --max-time 30 "$trusted/$file" -o "$lock_root/$file"
+          done
+          (cd "$lock_root" && sha256sum --check <<'LOCKS'
+          891ec3a55b9fccf0b49fe0ac0a98f9e9fd5bbd7f1743e0f0e51d6286a178d16b  package.json
+          aa53698b9420885d999a383abe2f5fafa453bd5aa938dc9ff3ce3e1ef42551a9  package-lock.json
+          LOCKS
+          npm ci --ignore-scripts --no-audit --no-fund)
+
+          mirror="$RUNNER_TEMP/version.git"
+          metadata="$RUNNER_TEMP/version-metadata"
+          git clone --quiet --bare --shared "$GITHUB_WORKSPACE" "$mirror"
+          git -C "$mirror" update-ref "refs/heads/$release_branch" "$GITHUB_SHA"
+          if [[ "$release_branch" != master ]]; then
+            git -C "$mirror" update-ref refs/heads/master "$(git rev-parse refs/remotes/origin/master)"
+          fi
+          git init --quiet --initial-branch="$release_branch" "$metadata"
+          git -C "$metadata" remote add origin "$mirror"
+          git -C "$metadata" fetch --quiet --tags origin "refs/heads/$release_branch:refs/version-source"
+          git -C "$metadata" update-ref "refs/heads/$release_branch" "$GITHUB_SHA"
+
+          jq -n --arg branch "$release_branch" --arg header "$INITIAL_IMPORT" '{
+            branches: (["master"] + if $branch == "master" then [] else [{name:$branch, prerelease:$branch, channel:$branch}] end),
+            plugins: [["@semantic-release/commit-analyzer",
+                       {releaseRules: (if $header == "" then [] else [{header:$header,release:"minor"}] end)}]],
+            tagFormat: "v${version}"
+          }' > "$metadata/.releaserc.json"
+          log="$RUNNER_TEMP/semantic-release.log"
+          (
+            cd "$metadata"
+            env -i PATH="$PATH" HOME="$metadata" LANG=C.UTF-8 NO_COLOR=1 \
+              GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+              "$lock_root/node_modules/.bin/semantic-release" --dry-run --no-ci --repository-url "$mirror"
+          ) 2>&1 | tee "$log"
+          version="$(sed -n 's/^.*[Tt]he next release version is //p' "$log")"
+          [[ "$version" =~ $version_pattern ]]
+          grep -Fq "Skip v$version tag creation in dry-run mode" "$log"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  container:
+    name: Build, check and publish the runtime container
+    needs: application
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+    concurrency:
+      group: ghcr-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      VERSION: ${{ needs.application.outputs.version }}
+      REUSE_DIGEST: ${{ needs.application.outputs.reuse_digest }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout and upstream
+        if: ${{ needs.application.outputs.reuse_digest == '' }}
         shell: bash
         run: |
+          [[ "$(git rev-parse HEAD)" == "${EXPECTED_SOURCE_SHA,,}" ]]
+          [[ -f Containerfile ]]
+          qualification_dir=$(mktemp -d "$RUNNER_TEMP/litellm-qualification.XXXXXXXX")
+          set -euo pipefail
+          output=$qualification_dir
+          index=bc803c88c244d6193b0f40bffad1124c624109513e56332b03c20d121a9546fb
+          amd64=ec96da9f0c6286523a1f7646ecc8991c2455fb9b32cd24d19f9d237ff17ce6cf
+          arm64=66d944d56370313bcf3bed9bfdee91d7f199122e76b194be460fc8661ba85711
+          source=e926084212ab2eb234c58840d741b3c62c35911b
+          token=$(curl -q -fsS 'https://ghcr.io/token?scope=repository:berriai/litellm:pull' |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          for ref in "sha256:$index" "sha256:$amd64" "sha256:$arm64" v1.104.0-rc.2; do
+            curl -q -fsS --retry 2 --max-time 45 --proto '=https' -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://ghcr.io/v2/berriai/litellm/manifests/$ref" -o "$output/${ref#sha256:}.json"
+          done
+          (
+            cd "$output"
+            printf '%s  %s\n' "$index" "$index.json" "$index" v1.104.0-rc.2.json \
+              "$amd64" "$amd64.json" "$arm64" "$arm64.json" | sha256sum --check
+          )
+          python3 - "$output/$index.json" "$amd64" "$arm64" <<'PYTHON'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as file:
+              index = json.load(file)
+          assert index["mediaType"] == "application/vnd.oci.image.index.v1+json"
+          platforms = {d["platform"]["architecture"]: d["digest"]
+                       for d in index["manifests"] if d["platform"]["os"] == "linux"}
+          assert platforms == {"amd64": "sha256:" + sys.argv[2], "arm64": "sha256:" + sys.argv[3]}
+          PYTHON
+          curl -q -fsS --retry 2 --max-time 45 --proto '=https' \
+            "https://raw.githubusercontent.com/BerriAI/litellm/$source/LICENSE" -o "$output/LiteLLM-LICENSE"
+          cmp licenses/LiteLLM-LICENSE "$output/LiteLLM-LICENSE"
+          printf 'upstream_version=v1.104.0-rc.2 upstream_source=%s upstream_index=sha256:%s upstream_amd64=sha256:%s upstream_arm64=sha256:%s\n' "$source" "$index" "$amd64" "$arm64"
+          printf 'QUALIFICATION_DIR=%s\n' "$qualification_dir" >> "$GITHUB_ENV"
+
+      - name: Build and inspect the OCI image
+        if: ${{ needs.application.outputs.reuse_digest == '' }}
+        shell: bash
+        run: |
+          context="$RUNNER_TEMP/runtime"
+          mkdir -p "$context/config" "$context/licenses"
+          cp Containerfile entrypoint.sh LICENSE "$context/"
+          cp config/litellm.yaml "$context/config/"
+          cp licenses/LiteLLM-LICENSE licenses/PgBouncer*-COPYRIGHT "$context/licenses/"
           podman --version
           podman build --platform linux/amd64 --format oci --timestamp 0 --omit-history \
-            --iidfile "$QUALIFICATION_DIR/image.id" --file Containerfile .
+            --iidfile "$QUALIFICATION_DIR/image.id" --file "$context/Containerfile" "$context"
           podman push --format oci --compression-format gzip \
             --digestfile "$QUALIFICATION_DIR/manifest.digest" "$(cat "$QUALIFICATION_DIR/image.id")" \
             "oci:$QUALIFICATION_DIR/image"
@@ -248,6 +436,7 @@ jobs:
           PYTHON
 
       - name: Verify the packaged gateway
+        if: ${{ needs.application.outputs.reuse_digest == '' }}
         shell: bash
         run: |
           # Exercise the packaged FlowAI wrapper against a disposable PostgreSQL dependency.
@@ -357,52 +546,118 @@ jobs:
           probe read
           printf 'FlowAI model metadata survived gateway recreation\n'
 
-      - name: Verify and package the qualified OCI image
-        shell: bash
+      - name: Publish the tested immutable version
+        id: publish
+        env:
+          GHCR_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          image_id="$(cat "$QUALIFICATION_DIR/image.id")"
-          [[ "$image_id" =~ ^(sha256:)?[a-f0-9]{64}$ ]]
-          image_id="sha256:${image_id#sha256:}"
-          layout="$QUALIFICATION_DIR/image"
-          manifest="$(jq -er '
-            select(.schemaVersion == 2 and (.manifests | length) == 1)
-            | .manifests[0]
-            | select(.mediaType == "application/vnd.oci.image.manifest.v1+json")
-            | .digest | select(test("^sha256:[a-f0-9]{64}$"))
-          ' "$layout/index.json")"
-          cd "$layout"
-          manifest_path="blobs/sha256/${manifest#sha256:}"
-          printf '%s  %s\n' "${manifest#sha256:}" "$manifest_path" | sha256sum --check
-          config="$(jq -er '.config.digest | select(test("^sha256:[a-f0-9]{64}$"))' "$manifest_path")"
-          [[ "$manifest" == "$(cat "$QUALIFICATION_DIR/manifest.digest")" ]]
-          jq -er '
-            [.config, .layers[]][].digest
-            | if test("^sha256:[a-f0-9]{64}$") then sub("^sha256:"; "") else error("invalid OCI digest") end
-            | "\(.)  blobs/sha256/\(.)"
-          ' "$manifest_path" | sha256sum --check
-          jq -e '.os == "linux" and .architecture == "amd64"' "blobs/sha256/${config#sha256:}" >/dev/null
+          umask 077
+          state="$(mktemp -d "$RUNNER_TEMP/registry.XXXXXX")"
+          image="ghcr.io/$GITHUB_REPOSITORY"
+          scope="scope=repository:$GITHUB_REPOSITORY:pull"
+          media='application/vnd.oci.image.manifest.v1+json'
+          lookup() {
+            printf 'header = "Authorization: Bearer %s"\n' "$1" |
+              curl -q --config - -sS --max-time 30 -H "Accept: $media" \
+                -o "$state/manifest" -w '%{http_code}' "https://ghcr.io/v2/$GITHUB_REPOSITORY/manifests/$2"
+          }
+          check_digest() {
+            printf '%s  %s\n' "${digest#sha256:}" "$state/manifest" | sha256sum --check
+          }
+          if [[ -n "$REUSE_DIGEST" ]]; then
+            digest="$REUSE_DIGEST"
+          else
+            digest="$(cat "$QUALIFICATION_DIR/manifest.digest")"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            token="$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GHCR_TOKEN" |
+              curl -q --config - -fsS --max-time 30 --get https://ghcr.io/token \
+                --data-urlencode service=ghcr.io --data-urlencode "$scope,push" | jq -er .token)"
+            [[ "$token" =~ ^[A-Za-z0-9_.=+/-]+$ ]]
+            printf '::add-mask::%s\n' "$token"
+            status="$(lookup "$token" "$VERSION")"
+            case "$status" in
+              200) check_digest ;;
+              404)
+                absent() {
+                  jq -e '(.errors | length) == 1 and (.errors[0].code | IN("MANIFEST_UNKNOWN", "NAME_UNKNOWN"))' "$state/manifest" >/dev/null
+                }
+                absent
+                printf '%s\n' "$GHCR_TOKEN" | podman login --authfile "$state/auth.json" ghcr.io \
+                  --username "$GITHUB_ACTOR" --password-stdin
+                [[ "$(lookup "$token" "$VERSION")" == 404 ]]
+                absent
+                skopeo copy --preserve-digests --dest-authfile "$state/auth.json" \
+                  "oci:$QUALIFICATION_DIR/image" "docker://$image:$VERSION"
+                ;;
+              *) exit 1 ;;
+            esac
+          fi
 
-          artifact="$RUNNER_TEMP/qualified-oci"
-          mkdir "$artifact"
-          tar -cf "$artifact/image.oci.tar" oci-layout index.json blobs
-          cd "$artifact"
-          jq -n --arg repository "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF" \
-            --arg source "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg imageId "$image_id" --arg manifest "$manifest" --arg config "$config" \
-            '{repository:$repository,ref:$ref,source:$source,run:$run,attempt:$attempt,imageId:$imageId,manifest:$manifest,config:$config}' > receipt.json
-          sha256sum image.oci.tar receipt.json > SHA256SUMS
-          sha256sum --check SHA256SUMS
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          public="$(curl -q -fsS --max-time 30 --get https://ghcr.io/token \
+            --data-urlencode service=ghcr.io --data-urlencode "$scope" | jq -er .token)"
+          [[ "$public" =~ ^[A-Za-z0-9_.=+/-]+$ ]]
+          printf '::add-mask::%s\n' "$public"
+          for locator in "$VERSION" "$digest"; do
+            [[ "$(lookup "$public" "$locator")" == 200 ]]
+            check_digest
+          done
+          printf '{}\n' > "$state/anonymous.json"
+          podman pull --authfile "$state/anonymous.json" --platform linux/amd64 "$image@$digest"
+          printf 'image_ref=%s@%s\n' "$image" "$digest" >> "$GITHUB_OUTPUT"
 
-      - name: Upload qualified OCI archive
-        if: ${{ success() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Record the stable semantic-release version
+        if: ${{ github.ref_name == 'master' && needs.application.outputs.reuse_digest == '' }}
+        env:
+          VERSION: ${{ needs.application.outputs.version }}
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+          PRODUCTION_IDENTITY: ${{ needs.application.outputs.production_identity }}
+          RELEASE_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$PRODUCTION_IDENTITY" =~ ^sha256:[a-f0-9]{64}$ ]]
+          url="https://github.com/$GITHUB_REPOSITORY.git"
+          tag="v$VERSION"
+          target="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          [[ "$IMAGE_REF" =~ @sha256:[a-f0-9]{64}$ ]]
+          record="$(jq -cn --arg repository "$GITHUB_REPOSITORY" --arg source "$target" \
+            --arg version "$VERSION" --arg digest "${IMAGE_REF#*@}" --arg identity "$PRODUCTION_IDENTITY" '
+            {schema:1,stage:"stable",repository:$repository,version:$version,
+             buildSourceRevision:$source,imageDigest:$digest,productionIdentity:$identity}')"
+          if git fetch --quiet --no-tags "$url" "refs/tags/$tag" 2> "$RUNNER_TEMP/release-tag-fetch.log"; then
+            [[ "$(git rev-parse "FETCH_HEAD^{commit}")" == "$target" ]]
+            [[ "$(git cat-file -t FETCH_HEAD)" == tag ]]
+            [[ "$(git cat-file tag FETCH_HEAD | sed '1,/^$/d')" == "$record" ]]
+          else
+            grep -Fq "couldn't find remote ref refs/tags/$tag" "$RUNNER_TEMP/release-tag-fetch.log"
+            git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+              tag -a -m "$record" "$tag" "$target"
+            auth="$(printf 'x-access-token:%s' "$RELEASE_TOKEN" | base64 -w 0)"
+            printf '::add-mask::%s\n' "$auth"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+              GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+              git push "$url" "refs/tags/$tag:refs/tags/$tag"
+          fi
+
+      - name: Emit qualification receipt
+        env:
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+          BUILD_SOURCE: ${{ needs.application.outputs.build_source_revision }}
+        run: |
+          workflow="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"
+          workflow="${workflow%@*}"
+          build=success
+          if [[ -n "$REUSE_DIGEST" ]]; then build=not-applicable; fi
+          jq -n --arg repository "$GITHUB_REPOSITORY" --arg source "$GITHUB_SHA" \
+            --arg built "$BUILD_SOURCE" --arg version "$VERSION" --arg digest "${IMAGE_REF#*@}" \
+            --arg workflow "$workflow" --argjson run "$GITHUB_RUN_ID" --arg build "$build" '
+            {schema:1,repository:$repository,sourceRevision:$source,buildSourceRevision:$built,
+             version:$version,imageDigest:$digest,schemaInputs:[],workflowPath:$workflow,
+             runId:$run,outcomes:{unit:"not-applicable",integration:"not-applicable",build:$build}}
+          ' > "$RUNNER_TEMP/qualification.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: qualified-oci-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/qualified-oci/image.oci.tar
-            ${{ runner.temp }}/qualified-oci/receipt.json
-            ${{ runner.temp }}/qualified-oci/SHA256SUMS
+          name: qualification-receipt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification.json
           if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
