@@ -1,0 +1,11 @@
+# Owned, versioned LiteLLM settings. Models, credentials, teams and virtual
+# keys live only in the database and are managed through the authenticated
+# management API; nothing mutable is bootstrapped from this file.
+general_settings:
+  store_model_in_db: true
+litellm_settings:
+  # Budget rejections must never share a status with per-minute rate limits.
+  budget_exceeded_status_code: 422
+  # Flow budget periods are calendar periods in UTC.
+  budget_reset_time: "00:00"
+  timezone: "UTC"
